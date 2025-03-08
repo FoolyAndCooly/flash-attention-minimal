@@ -8,7 +8,7 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
 		    const int n_kv_h, const int num,
                     float* l, float *m, float* O) {
     int tx = threadIdx.x;
-    int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
+    int bx = blockIdx.x; int by = blockIdx.y; int bz = blockIdx.z; // batch and head index
 
     // Offset into Q,K,V,O,l,m - different for each batch and head
     int q_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
@@ -25,72 +25,67 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
     float* Vj = &sram[tile_size_qo * 2 + tile_size_kv];
     float* S = &sram[tile_size_qo * 2 + tile_size_kv * 2];
 
-    for (int i = 0; i < Tr; i++) {
-
-        // Load Qi to SRAM
-        for (int x = 0; x < d; x++) {
-            Qi[(tx * d) + x] = Q[q_offset + (tile_size_qo * i) + (tx * d) + x];
-            Oi[(tx * d) + x] = 0; // zero
-        }
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
-        
-	float row_m_prev = -INFINITY;
-        float row_l_prev = 0;
-        float row_m_new, row_l_new;
-
-        for (int j = 0; j < Tc; j++)  {
-	    
-	    // Load Kj, Vj to SRAM
-            for (int x = 0; x < d; x++) {
-                Kj[(tx * d) + x] = K[kv_offset + (tile_size_kv * j) + (tx * d) + x];
-                Vj[(tx * d) + x] = V[kv_offset + (tile_size_kv * j) + (tx * d) + x];
-	    }
-            // S = QK^T, row_m = rowmax(S)
-            float row_m = -INFINITY;
-            for (int y = 0; y < Bc; y++) {
-                float sum = 0;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
-                }
-                sum *= softmax_scale;
-                S[(Bc * tx) + y] = sum;
-
-                if (sum > row_m)
-                    row_m = sum;
-            }
-            
-	    // Compute new m
-            row_m_new = max(row_m_prev, row_m);
-
-            // P = exp(S - row_m), row_l = rowsum(P)
-            float row_l = 0;
-            for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m_new);
-                row_l += S[(Bc * tx) + y];
-            }
-
-            // Compute l
-            row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + row_l;
-
-            // Write O, l, m to HBM
-            for (int x = 0; x < d; x++) {
-                float pv = 0;  // Pij * Vj
-                for (int y = 0; y < Bc; y++) {
-                    pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
-                }
-                Oi[(tx * d) + x] = (__expf(row_m_prev - row_m_new)) * Oi[(tx * d) + x] + pv;
-            }
-
-	    // Update l, m
-	    row_l_prev = row_l_new;
-	    row_m_prev = row_m_new;
-        }
-	for (int x = 0; x < d; x++) {
-            O[q_offset + (tile_size_qo * i) + (tx * d) + x] = 1 / row_l_new * Oi[(tx * d) + x];
-	}
-
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
+    // Load Qi to SRAM
+    for (int x = 0; x < d; x++) {
+        Qi[(tx * d) + x] = Q[q_offset + (tile_size_qo * bz) + (tx * d) + x];
+        Oi[(tx * d) + x] = 0; // zero
     }
+    
+    float row_m_prev = -INFINITY;
+    float row_l_prev = 0;
+    float row_m_new, row_l_new;
+
+    for (int j = 0; j < Tc; j++)  {
+        
+        // Load Kj, Vj to SRAM
+        for (int x = 0; x < d; x++) {
+            Kj[(tx * d) + x] = K[kv_offset + (tile_size_kv * j) + (tx * d) + x];
+            Vj[(tx * d) + x] = V[kv_offset + (tile_size_kv * j) + (tx * d) + x];
+        }
+        // S = QK^T, row_m = rowmax(S)
+        float row_m = -INFINITY;
+        for (int y = 0; y < Bc; y++) {
+            float sum = 0;
+            for (int x = 0; x < d; x++) {
+                sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
+            }
+            sum *= softmax_scale;
+            S[(Bc * tx) + y] = sum;
+
+            if (sum > row_m)
+                row_m = sum;
+        }
+        
+        // Compute new m
+        row_m_new = max(row_m_prev, row_m);
+
+        // P = exp(S - row_m), row_l = rowsum(P)
+        float row_l = 0;
+        for (int y = 0; y < Bc; y++) {
+            S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m_new);
+            row_l += S[(Bc * tx) + y];
+        }
+
+        // Compute l
+        row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + row_l;
+
+        // Write O, l, m to HBM
+        for (int x = 0; x < d; x++) {
+            float pv = 0;  // Pij * Vj
+            for (int y = 0; y < Bc; y++) {
+                pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
+            }
+            Oi[(tx * d) + x] = (__expf(row_m_prev - row_m_new)) * Oi[(tx * d) + x] + pv;
+        }
+
+        // Update l, m
+        row_l_prev = row_l_new;
+        row_m_prev = row_m_new;
+    }
+    for (int x = 0; x < d; x++) {
+        O[q_offset + (tile_size_qo * bz) + (tx * d) + x] = 1 / row_l_new * Oi[(tx * d) + x];
+    }
+
 }
 
 torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
@@ -117,7 +112,7 @@ torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
     cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
     printf("Max shared memory: %d, requested shared memory: %d \\n", max_sram_size, sram_size);
 
-    dim3 grid_dim(B, nqh);  // batch_size x num_heads
+    dim3 grid_dim(B, nqh, Tr);  // batch_size x num_heads x Tr
     dim3 block_dim(Bc);  // Bc threads per block
 
     forward_kernel<<<grid_dim, block_dim, sram_size>>>(
