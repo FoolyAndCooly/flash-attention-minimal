@@ -18,12 +18,19 @@ torch.manual_seed(45)
 q = torch.randn(batch_size, n_q_head, seq_len, head_embd).cuda()
 k = torch.randn(batch_size, n_kv_head, seq_len, head_embd).cuda()
 v = torch.randn(batch_size, n_kv_head, seq_len, head_embd).cuda()
+mask = torch.tril(torch.ones(seq_len, seq_len), diagonal=0).bool().cuda()
 print('=== profiling manual attention ===')
+
+def causal_softmax(x):
+    mask = torch.tril(torch.ones_like(x), diagonal=-1).flip(dims=[-2, -1])
+    y = x.clone()
+    masked = torch.where(mask == 1, -torch.inf, y) 
+    return F.softmax(masked, dim=-1)
 
 # Our minimal flash attention aims to be faster than this by avoiding HBM read/writes of N^2 matrices.
 def manual_attn(q, k, v):
     att = (q.reshape(batch_size, n_kv_head, -1, head_embd) @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1))))
-    att = F.softmax(att, dim=-1)
+    att = causal_softmax(att.reshape(batch_size, n_q_head, seq_len, seq_len)).reshape(batch_size, n_kv_head, -1, seq_len)
     y = att @ v
     return y.reshape(batch_size, n_q_head, -1, head_embd)
 

@@ -37,6 +37,8 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
 
     for (int j = 0; j < Tc; j++)  {
         
+        if ((bz + 1) * Br < j * Bc) continue;
+
         // Load Kj, Vj to SRAM
         for (int x = 0; x < d; x++) {
             Kj[(tx * d) + x] = K[kv_offset + (tile_size_kv * j) + (tx * d) + x];
@@ -44,13 +46,15 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
         }
         // S = QK^T, row_m = rowmax(S)
         float row_m = -INFINITY;
+
+	int not_mask = (bz * Br > (j + 1) * Bc);
         for (int y = 0; y < Bc; y++) {
             float sum = 0;
             for (int x = 0; x < d; x++) {
                 sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
             }
             sum *= softmax_scale;
-            S[(Bc * tx) + y] = sum;
+            S[(Bc * tx) + y] = (~not_mask & (bz * Br + tx < j * Bc + y)) ? -INFINITY : sum;
 
             if (sum > row_m)
                 row_m = sum;
