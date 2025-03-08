@@ -17,30 +17,34 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
 
     // Define SRAM for Q,K,V,S
     extern __shared__ float sram[];
-    int tile_size = Bc * d;  // size of Qi, Kj, Vj
+    int tile_size_qo = Br * d;  // size of Qi, Oi
+    int tile_size_kv = Bc * d;  // size of Kj, Vj
     float* Qi = sram;
-    float* Kj = &sram[tile_size];
-    float* Vj = &sram[tile_size * 2];
-    float* S = &sram[tile_size * 3];
+    float* Oi = &sram[tile_size_qo];
+    float* Kj = &sram[tile_size_qo * 2];
+    float* Vj = &sram[tile_size_qo * 2 + tile_size_kv];
+    float* S = &sram[tile_size_qo * 2 + tile_size_kv * 2];
 
-    for (int j = 0; j < Tc; j++) {
+    for (int i = 0; i < Tr; i++) {
 
-        // Load Kj, Vj to SRAM
+        // Load Qi to SRAM
         for (int x = 0; x < d; x++) {
-            Kj[(tx * d) + x] = K[kv_offset + (tile_size * j) + (tx * d) + x];
-            Vj[(tx * d) + x] = V[kv_offset + (tile_size * j) + (tx * d) + x];
+            Qi[(tx * d) + x] = Q[q_offset + (tile_size_qo * i) + (tx * d) + x];
+            Oi[(tx * d) + x] = 0; // zero
         }
         __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+        
+	float row_m_prev = -INFINITY;
+        float row_l_prev = 0;
+        float row_m_new, row_l_new;
 
-        for (int i = 0; i < Tr; i++)  {
-
-            // Load Qi to SRAM, l and m to registers
+        for (int j = 0; j < Tc; j++)  {
+	    
+	    // Load Kj, Vj to SRAM
             for (int x = 0; x < d; x++) {
-                Qi[(tx * d) + x] = Q[q_offset + (tile_size * i) + (tx * d) + x];
-            }
-            float row_m_prev = m[lm_offset + (Br * i) + tx];
-            float row_l_prev = l[lm_offset + (Br * i) + tx];
-
+                Kj[(tx * d) + x] = K[kv_offset + (tile_size_kv * j) + (tx * d) + x];
+                Vj[(tx * d) + x] = V[kv_offset + (tile_size_kv * j) + (tx * d) + x];
+	    }
             // S = QK^T, row_m = rowmax(S)
             float row_m = -INFINITY;
             for (int y = 0; y < Bc; y++) {
@@ -54,17 +58,19 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
                 if (sum > row_m)
                     row_m = sum;
             }
+            
+	    // Compute new m
+            row_m_new = max(row_m_prev, row_m);
 
             // P = exp(S - row_m), row_l = rowsum(P)
             float row_l = 0;
             for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
+                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m_new);
                 row_l += S[(Bc * tx) + y];
             }
 
-            // Compute new m and l
-            float row_m_new = max(row_m_prev, row_m);
-            float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
+            // Compute l
+            row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + row_l;
 
             // Write O, l, m to HBM
             for (int x = 0; x < d; x++) {
@@ -72,13 +78,17 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
                 for (int y = 0; y < Bc; y++) {
                     pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
                 }
-                O[q_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
-                    * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[q_offset + (tile_size * i) + (tx * d) + x]) \
-                    + (__expf(row_m - row_m_new) * pv));
+                Oi[(tx * d) + x] = (__expf(row_m_prev - row_m_new)) * Oi[(tx * d) + x] + pv;
             }
-            m[lm_offset + (Br * i) + tx] = row_m_new;
-            l[lm_offset + (Br * i) + tx] = row_l_new;
+
+	    // Update l, m
+	    row_l_prev = row_l_new;
+	    row_m_prev = row_m_new;
         }
+	for (int x = 0; x < d; x++) {
+            O[q_offset + (tile_size_qo * i) + (tx * d) + x] = 1 / row_l_new * Oi[(tx * d) + x];
+	}
+
         __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
     }
 }
@@ -102,7 +112,7 @@ torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
     l = l.to(device); m = m.to(device);
 
     // Calculate SRAM size needed per block
-    const int sram_size = (3 * Bc * d * sizeof(float)) + (Bc * Br * sizeof(float));
+    const int sram_size = (2 * Br * d * sizeof(float)) + (2 * Bc * d * sizeof(float)) + (Bc * Br * sizeof(float));
     int max_sram_size;
     cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
     printf("Max shared memory: %d, requested shared memory: %d \\n", max_sram_size, sram_size);
